@@ -13,6 +13,7 @@ import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.Test;
 
+import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -68,7 +69,7 @@ public class PerformanceTest_MQ extends BaseTest {
         log.info(">>> [MQ方案] 开始压测，TemplateID: {}, USER_COUNT:{} " , templateId, USER_COUNT);
 
         for(int i =0;i<USER_COUNT;i++){
-            String uid = String.valueOf(System.nanoTime()) + i;
+            String uid = String.valueOf(Math.abs(UUID.randomUUID().getMostSignificantBits()));
             executor.submit(()->{
                 try {
                     start.await();
