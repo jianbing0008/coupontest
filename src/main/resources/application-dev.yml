@@ -1,0 +1,12 @@
+test-config:
+  merchant-url: http://127.0.0.1:10010
+  engine-url: http://127.0.0.1:10020
+  timeout: 10000
+
+spring:
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    # 连接分库分表后的其中一个库进行采样验证，通常连 0 库即可
+    url: jdbc:mysql://127.0.0.1:3306/one_coupon_0?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
+    username: oneCoupon
+    password: 123456qaq  # <--- 【重要】请修改为你的本地 MySQL 密码
