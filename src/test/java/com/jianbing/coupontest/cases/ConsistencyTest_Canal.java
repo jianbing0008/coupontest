@@ -1,5 +1,9 @@
 package com.jianbing.coupontest.cases;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.jianbing.coupontest.dao.entity.UserCouponDO;
+import com.jianbing.coupontest.dao.mapper.UserCouponMapper;
 import com.jianbing.coupontest.req.CouponTemplateRedeemReq;
 import com.jianbing.coupontest.req.CouponTemplateReq;
 import com.jianbing.coupontest.service.EngineApi;
@@ -9,8 +13,11 @@ import io.qameta.allure.*;
 import io.restassured.response.Response;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.testng.Assert;
 import org.testng.annotations.Test;
+
+import java.util.concurrent.TimeUnit;
 
 @Epic("优惠卷系统-架构验证")
 @Feature("方案二：Canal同步强一致")
@@ -21,22 +28,27 @@ public class ConsistencyTest_Canal extends BaseTest {
     private MerchantAdminApi merchantAdminApi;
     @Autowired
     private EngineApi engineApi;
+    @Autowired
+    private UserCouponMapper userCouponMapper;
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
+
+    // 读取 Redis 前缀配置
+    private static final String REDIS_PREFIX = System.getProperty("framework.cache.redis.prefix", "");
+    // Redis List Key 格式 (Canal 消费者最终会写入这个 Key)
+    private static final String REDIS_LIST_KEY_PATTERN = REDIS_PREFIX + "one-coupon_engine:user-template-list:%s";
 
     private String templateId;
 
     @Test(priority = 1, description = "准备工作：创建用于Canal同步测试的优惠券")
     @Story("构造测试数据")
     public void prepareData() {
-        // 创建库存 50 的券
         CouponTemplateReq req = CouponTemplateReq.builder()
                 .name("Canal强一致测试券_" + System.currentTimeMillis())
-                .source(0) // 店铺券
-                .target(0) // 商品专属
-                .goods("456")
-                .type(0)   // 立减券
-                .validStartTime("2024-01-01 00:00:00")
+                .source(0).target(0).goods("CanalGoods").type(0)
+                .validStartTime("2025-12-05 00:00:00")
                 .validEndTime("2025-12-31 23:59:59")
-                .stock(50)
+                .stock(50) // 小库存即可
                 .receiveRule("{\"limitPerPerson\":1,\"usageInstructions\":\"Canal Test\"}")
                 .consumeRule("{\"termsOfUse\":10,\"maximumDiscountAmount\":5,\"validityPeriod\":48}")
                 .build();
@@ -44,20 +56,16 @@ public class ConsistencyTest_Canal extends BaseTest {
         Response resp = merchantAdminApi.createCouponTemplate(req);
         Assert.assertEquals(resp.getStatusCode(), 200);
         this.templateId = resp.jsonPath().getString("data");
-        System.out.println(">>> [Canal方案] 准备就绪，TemplateID: " + templateId);
+        log.info(">>> [Canal方案] 准备就绪，TemplateID: {}", templateId);
     }
 
-    @Test(priority = 2, dependsOnMethods = "prepareData", description = "验证同步接口的强一致性")
-    @Story("核心验证：接口返回200时，数据库必须已有记录")
+    @Test(priority = 2, dependsOnMethods = "prepareData", description = "验证同步接口的强一致性及Canal异步同步")
+    @Story("核心验证：接口返回即落库，Redis异步同步")
     @Severity(SeverityLevel.CRITICAL)
-    public void testStrongConsistency() {
-        // 构造一个唯一用户ID
-        // ❌ 修改前：随机ID，可能查不到数据
-        // String userId = "CANAL_USER_" + System.currentTimeMillis();
-
-        // ✅ 修改后：生成必然落入 t_user_coupon_0 的 ID
+    public void testStrongConsistencyAndCanalSync() throws InterruptedException {
+        // 1. 构造必定落在 t_user_coupon_0 表的用户 ID
         String userId = ShardingUtil.generateUserIdForTable0();
-        log.info(">>> [Canal方案] 构造用户ID: " + userId);
+        log.info(">>> [Canal方案] 构造用户ID: {} (定向路由至 Table_0)", userId);
 
         CouponTemplateRedeemReq req = CouponTemplateRedeemReq.builder()
                 .source(0)
@@ -65,38 +73,56 @@ public class ConsistencyTest_Canal extends BaseTest {
                 .couponTemplateId(templateId)
                 .build();
 
-        // 1. 调用同步接口 (方案二：Canal + 编程式事务)
-        // 这个接口在后端是先写数据库，事务提交后，才返回 HTTP 200
+        // 2. 调用同步接口 (方案二)
+        // 预期：后端执行 DB 事务 -> 提交 -> 返回 200
         long start = System.currentTimeMillis();
-        Response resp = engineApi.redeemByCanal(req, userId);
+        Response resp = engineApi.redeemByCanal(req, userId); // 假设 EngineApi 中已封装该接口
         long cost = System.currentTimeMillis() - start;
 
-        // 验证响应
-        System.out.println(">>> Canal接口耗时: " + cost + "ms (包含DB事务提交)");
+        log.info(">>> [Canal方案] 接口耗时: {} ms (含DB事务提交)", cost);
+
+        // 基础断言：接口调用成功
         Assert.assertEquals(resp.getStatusCode(), 200);
         Assert.assertEquals(resp.jsonPath().getString("code"), "0", "抢券失败：" + resp.getBody().asString());
 
-        // 2. 核心验证：立即查询数据库
-        // 不需要像 MQ 方案那样 Thread.sleep()，因为这是强一致性接口
-        System.out.println(">>> 接口返回成功，立即校验数据库...");
+        // --------------------------------------------------------------------------------
+        // 验证点一：数据库强一致性 (立即验证，不等待)
+        // --------------------------------------------------------------------------------
+        log.info(">>> [Canal方案] 步骤1：立即校验数据库 (Expecting Record Immediately)...");
 
-        // 调用 BaseTest 中基于 MyBatis-Plus 封装的查询方法
-        // 注意：由于是分库分表，我们这里只配置了 ds_0，如果 userId 路由到了 ds_1，这里可能查不到 (返回0)
-        // 在真实 CI/CD 环境中，应该配置所有分片库的数据源
-        Long count = getDBReceivedCount(templateId);
+        LambdaQueryWrapper<UserCouponDO> query = Wrappers.lambdaQuery(UserCouponDO.class)
+                .eq(UserCouponDO::getUserId, Long.valueOf(userId))
+                .eq(UserCouponDO::getCouponTemplateId, Long.valueOf(templateId));
 
-        System.out.println(">>> 数据库(ds_0)查询结果: " + count);
+        // 直接查询，如果不为 1 则说明事务没提交就返回了，属于严重 Bug
+        Long dbCount = userCouponMapper.selectCount(query);
+        log.info(">>> [Canal方案] 数据库查询结果: {}", dbCount);
 
-        // 只有当 count >= 0 时才断言（-1代表查询异常）
-        if (count != -1) {
-            // 如果运气好路由到了 ds_0，则断言必须为 1
-            // 如果路由到了 ds_1，这里查出来是 0，虽然不算错，但没验证到。
-            // 严谨做法：可以在这里打印一条警告，或者在 BaseTest 里遍历所有库
-            if (count == 0) {
-                System.out.println("⚠️ 警告：当前数据可能路由到了 ds_1 库，本地仅连接了 ds_0，无法验证数据落盘。建议更换 UserId 重试。");
-            } else {
-                Assert.assertEquals(count.intValue(), 1, "严重Bug：同步接口返回成功，但数据库记录数不对！");
+        Assert.assertEquals(dbCount.intValue(), 1,
+                "严重故障：[Canal方案] 接口返回成功但数据库未查询到记录！这违反了强一致性承诺。");
+
+        // --------------------------------------------------------------------------------
+        // 验证点二：Redis 最终一致性 (通过 Canal -> MQ -> Consumer 异步写入)
+        // --------------------------------------------------------------------------------
+        log.info(">>> [Canal方案] 步骤2：等待 Canal 异步同步 Redis (Max 10s)...");
+
+        String redisListKey = String.format(REDIS_LIST_KEY_PATTERN, userId);
+        boolean redisSynced = false;
+        long redisStart = System.currentTimeMillis();
+
+        // 轮询 Redis，等待 Binlog 监听器处理完毕
+        while (System.currentTimeMillis() - redisStart < 10000) {
+            if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(redisListKey))) {
+                redisSynced = true;
+                log.info(">>> [Canal方案] Redis 同步成功！耗时: {} ms", System.currentTimeMillis() - redisStart);
+                break;
             }
+            Thread.sleep(500);
         }
+
+        Assert.assertTrue(redisSynced,
+                "Canal 同步失败：10秒内 Redis 未检测到用户领券记录，请检查 Canal Server 或 MQ Binlog Consumer 状态。");
+
+        log.info(">>> [Canal方案] 测试全部通过：DB强一致性 ✅ + Redis最终一致性 ✅");
     }
 }
