@@ -40,4 +40,14 @@ public class EngineApi {
                 .post("/api/engine/user-coupon/redeem");
 
     }
+
+    @Step("API: 查询优惠券模板详情")
+    public Response findCouponTemplate(String templateId, String shopNumber) {
+        return restClient.getRequest()
+                .baseUri(envConfig.getEngineUrl())
+                .queryParam("couponTemplateId", templateId)
+                .queryParam("shopNumber", shopNumber)
+                .when()
+                .get("/api/engine/coupon-template/query");
+    }
 }
