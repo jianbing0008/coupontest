@@ -17,7 +17,6 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
-import java.util.concurrent.TimeUnit;
 
 @Epic("优惠卷系统-架构验证")
 @Feature("方案二：Canal同步强一致")
